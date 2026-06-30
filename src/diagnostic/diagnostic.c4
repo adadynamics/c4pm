@@ -1,0 +1,413 @@
+
+use std::memory::allocators::bump as allocator
+use std::string as string
+use std::list   as list
+
+use lexer::token as token
+
+foreign "C"{
+    fn printf(str fmt,...)->i32
+    fn puts(str s)->i32
+    fn fputc(i32 c,void *stream)->i32
+    fn fwrite(void *ptr,u64 size,u64 nmemb,void *stream)->u64
+    fn strlen(str s)->u64
+    fn strncpy(char *dst,const char *src,u64 n)->str
+
+    
+    //fn log_write(i32 level,str fmt,...)->void
+    //fn log_put_color(i32 color)->void
+    //fn log_reset_color()->void
+}
+
+
+//  severities ──
+
+enum DiagnosticSeverity{
+    Error
+    Warning
+    Note
+    Help
+}
+
+// ISSUE: LOG_LEVEL_NONE / LOG_COLOR_BOLD_RED / LOG_COLOR_BOLD_GREEN are
+// referenced from Log.h, not provided. Stand-in constants below — replace
+// with the real values once Log.h is translated.
+const i32 LOG_LEVEL_NONE       = 0
+const i32 LOG_COLOR_BOLD_RED   = 1
+const i32 LOG_COLOR_BOLD_GREEN = 2
+
+
+//  DiagnosticLabel 
+
+struct DiagnosticLabel{
+    token::Span span
+    str message
+    u32 isPrimary
+    u64 column
+}
+
+
+impl DiagnosticLabel{
+    fn Init(token::Span span,str message,u32 isPrimary,u64 column){
+        self->span      = span
+        self->message   = message
+        self->isPrimary = isPrimary
+        self->column    = column
+    }
+}
+
+fn MakeDiagnosticLabel(allocator::BumpAllocator *bump,token::Span span,str message,u32 isPrimary,u64 column)->DiagnosticLabel *{
+    DiagnosticLabel *node = bump->AllocType(sizeof(DiagnosticLabel),1,alignof(DiagnosticLabel))
+    node->Init(span,message,isPrimary,column)
+    return node
+}
+
+
+//  DiagnosticFix ──
+
+struct DiagnosticFix{
+    token::Span span
+    str replacement
+}
+
+impl DiagnosticFix{
+    fn Init(token::Span span,str replacement){
+        self->span        = span
+        self->replacement = replacement
+    }
+}
+
+
+
+fn MakeDiagnosticFix(allocator::BumpAllocator *bump,token::Span span,str replacement)->DiagnosticFix *{
+    DiagnosticFix *node = bump->AllocType(sizeof(DiagnosticFix),1,alignof(DiagnosticFix))
+    node->Init(span,replacement)
+    return node
+}
+
+
+//  Diagnostic ──
+
+struct Diagnostic{
+    DiagnosticSeverity severity
+    str message
+
+    str fileName
+    str source
+    u64 sourceLength
+
+    list::List labels
+    list::List fixes
+
+    str note
+    str help
+
+    u32 code
+}
+
+impl Diagnostic{
+    fn Init(DiagnosticSeverity severity,str message,str fileName,str source,u64 sourceLength,u32 code){
+        self->severity     = severity
+        self->message      = message
+        self->fileName     = fileName
+        self->source       = source
+        self->sourceLength = sourceLength
+        self->note         = null
+        self->help         = null
+        self->code         = code
+    }
+
+
+    // ── building up a diagnostic ──
+
+    fn AddLabel(token::Span span,str message,u32 isPrimary,allocator::BumpAllocator *bump){
+        DiagnosticLabel *label = MakeDiagnosticLabel(bump,span,message,isPrimary,0)
+        self->labels.PushBack(label)
+    }
+
+    fn AddFix(token::Span span,str replacement,allocator::BumpAllocator *bump){
+        DiagnosticFix *fix = MakeDiagnosticFix(bump,span,replacement)
+        self->fixes.PushBack(fix)
+    }
+
+    fn AddNote(str note,allocator::BumpAllocator *bump){
+        u64 len   = strlen(note)
+        self->note = bump->AllocType(1,len + 1,1)
+        strncpy(self->note as u8*,note,len)
+        self->note[len] = 0
+    }
+
+    fn AddHelp(str help,allocator::BumpAllocator *bump){
+        u64 len   = strlen(help)
+        self->help = bump->AllocType(1,len + 1,1)
+        strncpy(self->help as u8*,help,len)
+        self->help[len] = 0
+    }
+
+
+    // ── rendering 
+    //
+    // Two-pass label rendering. assign_columns() figures out which
+    // "rail" (vertical pipe column) each underline should be drawn on so
+    // that overlapping spans on the same source line stack instead of
+    // colliding visually — analogous to how rustc lays out multi-label
+    // diagnostics. RenderLabels() then prints the source line, the
+    // underline carets, and each label's message beneath it.
+
+    // Returns true if spans a and b overlap on the same line, based purely
+    // on column range (callers are expected to already be comparing labels
+    // that share a source line — this helper does not check line numbers).
+    fn SpansOverlap(token::Span a,token::Span b)->u32{
+        return !(a.endColumn < b.startColumn or b.endColumn < a.startColumn)
+    }
+
+    // Returns a pointer into source at the start of line `target` (1-based).
+    fn GetLineStart(str source,u64 len,u64 target)->str{
+        u64 line = 1
+        u64 i    = 0
+
+        while i < len and line < target{
+            if source[i] == 10{
+                line += 1
+            }
+
+            i += 1
+        }
+
+        return source + i
+    }
+
+    // Assigns each label a "column" (rail index) such that any two labels
+    // whose spans overlap end up on different rails, stacking outward.
+    fn AssignColumns(){
+        u64 count = self->labels.Length()
+
+        u64 i = 0
+
+        while i < count{
+            DiagnosticLabel *a = self->labels.At(i)
+            a->column = 0
+
+            u64 j = 0
+
+            while j < i{
+                DiagnosticLabel *b = self->labels.At(j)
+
+                if self->SpansOverlap(a->span,b->span){
+                    if b->column >= a->column{
+                        a->column = b->column + 1
+                    }
+                }
+
+                j += 1
+            }
+
+            i += 1
+        }
+    }
+
+    fn RenderLabels(){
+        self->AssignColumns()
+
+        u64 count = self->labels.Length()
+        u64 i     = 0
+
+        while i < count{
+            DiagnosticLabel *lbl = self->labels.At(i)
+
+            str line = self->GetLineStart(self->source,self->sourceLength,lbl->span.startLine)
+
+            u64 lineLen = 0
+
+            while line[lineLen] != 0 and line[lineLen] != 10{
+                lineLen += 1
+            }
+
+            //log_write(LOG_LEVEL_NONE,"%lu | %.*s",lbl->span.startLine,lineLen as i32,line)
+
+            printf("   | ")
+
+            u64 j = 0
+
+            while j < lbl->span.startColumn{
+                //fputc(' ' as i32,stdout)
+                j += 1
+            }
+
+            u64 c = 0
+
+            while c < lbl->column{
+                printf("| ")
+                c += 1
+            }
+
+            //log_put_color(LOG_COLOR_BOLD_RED)
+
+            u64 width = lbl->span.endColumn - lbl->span.startColumn
+
+            if width == 0{
+                width = 1
+            }
+
+            j = 0
+
+            while j < width{
+                //fputc('^' as i32,stdout)
+                j += 1
+            }
+
+            //log_reset_color()
+
+            printf("\n")
+
+            if lbl->message != null{
+                printf("  | ")
+
+                j = 1
+
+                while j < lbl->span.startColumn{
+                    //fputc(' ' as i32,stdout)
+                    j += 1
+                }
+
+                c = 0
+
+                while c < lbl->column{
+                    printf("| ")
+                    c += 1
+                }
+
+                printf("%s\n",lbl->message)
+            }
+
+            puts("")
+
+            i += 1
+        }
+    }
+
+    fn RenderFixes(){
+        u64 count = self->fixes.Length()
+        u64 i     = 0
+
+        while i < count{
+            DiagnosticFix *fix = self->fixes.At(i)
+
+            //log_write(LOG_LEVEL_NONE,"%C{bold_green}help%C{reset}:  replace with")
+
+            printf("  |\n")
+
+            str line = self->GetLineStart(self->source,self->sourceLength,fix->span.startLine)
+
+            printf("%lu | ",fix->span.startLine)
+
+            //fwrite(line,1,fix->span.startColumn - 1,stdout)
+
+            //log_put_color(LOG_COLOR_BOLD_GREEN)
+            printf("%s",fix->replacement)
+            //log_reset_color()
+
+            str after = line + fix->span.endColumn
+
+            while after@read() != 0 and after@read() != 10{
+                //fputc(after@read() as i32,stdout)
+                after@advance(1)
+            }
+
+            printf("\n\n")
+
+            i += 1
+        }
+    }
+}
+
+
+
+fn MakeDiagnostic(allocator::BumpAllocator *bump,DiagnosticSeverity severity,str message,str fileName,str source,u64 sourceLength,u32 code)->Diagnostic *{
+    Diagnostic *node = bump->AllocType(sizeof(Diagnostic),1,alignof(Diagnostic))
+    node->Init(severity,message,fileName,source,sourceLength,code)
+
+    node->labels.Init(bump)
+    node->fixes.Init(bump)
+
+    return node
+}
+
+
+//  DiagnosticEngine 
+
+struct DiagnosticEngine{
+    list::List diagnostics
+    allocator::BumpAllocator *bump
+
+    u32 hasErrors
+    u64 errorCount
+    u64 maxErrors
+}
+
+impl DiagnosticEngine{
+    fn Init(u64 maxErrors,allocator::BumpAllocator *bump){
+        self->diagnostics.Init(bump)
+        self->bump       = bump
+        self->hasErrors  = 0
+        self->errorCount = 0
+        self->maxErrors  = maxErrors
+    }
+
+    
+    fn Report(DiagnosticSeverity severity,str message,str fileName,str source,u64 sourceLength,u32 code)->Diagnostic *{
+        if self->errorCount >= self->maxErrors{
+            return null
+        }
+
+        Diagnostic *diag = MakeDiagnostic(self->bump,severity,message,fileName,source,sourceLength,code)
+        self->diagnostics.PushBack(diag)
+
+        Diagnostic *stored = self->diagnostics.At(self->diagnostics.Length() - 1)
+
+        if severity == DiagnosticSeverity::Error{
+            self->hasErrors   = 1
+            self->errorCount += 1
+        }
+
+        return stored
+    }
+
+    // Prints every collected diagnostic to stdout: a colored "error: msg" /
+    // "warning: msg" header, the underlined source labels, any note/help
+    // text, and any suggested fixes.
+    fn Emit(){
+        u64 count = self->diagnostics.Length()
+        u64 i     = 0
+
+        while i < count{
+            Diagnostic *d = self->diagnostics.At(i)
+
+            str kind = "warning"
+
+            if d->severity == DiagnosticSeverity::Error{
+                kind = "error"
+            }
+
+            //log_write(LOG_LEVEL_NONE,"%C{bold_red}%s%C{reset}: %s",kind,d->message)
+
+            d->RenderLabels()
+
+            if d->note != null{
+                //log_write(LOG_LEVEL_NONE,"%C{bold_cyan}note%C{reset}:  %s",d->note)
+            }
+
+            if d->help != null{
+                //log_write(LOG_LEVEL_NONE,"%C{bold_green}help%C{reset}:  %s",d->help)
+            }
+
+            d->RenderFixes()
+
+            printf("\n")
+
+            i += 1
+        }
+    }
+}
+
+        

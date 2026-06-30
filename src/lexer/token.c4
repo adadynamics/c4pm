@@ -1,0 +1,174 @@
+use std::string as string
+use std::memory::allocators::bump as bump
+
+
+// Defines all token categories produced by the lexer.
+// Covers operators, literals, keywords, punctuation, and error tokens.
+enum TokenKind{
+    // Assignment operators
+
+    ASSIGN
+
+    // Punctuation
+    LBRACKET
+    RBRACKET
+    COMMA
+    DOT
+    HASH
+    SINGLE_COMMENT
+
+    // Identifiers
+
+    IDENT
+
+    // Literals
+
+    LITERAL_INT
+    LITERAL_FLOAT
+    LITERAL_STRING
+    KEYWORD_TRUE
+    KEYWORD_FALSE
+
+
+    // Errors
+
+    ERROR_INVALID_CHARACTER
+    ERROR_MALFORMED_NUMBER
+    ERROR_UNTERMINATED_STRING
+    ERROR_UNTERMINATED_CHARACTER
+    ERROR_INVALID_ESCAPE_CHARACTER
+    ERROR_UNTERMINATED_COMMENT
+
+    EOF
+}
+
+
+
+// Represents a source code range (start/end positions + line/column info)
+// Used for error reporting, diagnostics, and AST node tracking
+struct Span{
+    // Byte offsets in the source buffer marking span boundaries
+    u64 start
+    u64 end
+
+    // Source location where the span begins (line and column)
+    u64 startLine
+    u64 startColumn
+
+    // Source location where the span ends (line and column)
+    u64 endLine
+    u64 endColumn
+}
+
+
+impl Span{
+    fn Init(u64 start,u64 end,u64 startLine,u64 startColumn,u64 endLine,u64 endColumn){
+        self->start       = start
+        self->end         = end
+        self->startLine   = startLine
+        self->startColumn = startColumn
+        self->endLine     = endLine
+        self->endColumn   = endColumn
+    }
+
+    fn SetStart(u64 value){
+        self->start = value
+    }
+
+    fn GetStart()->u64{
+        return self->start
+    }
+
+    fn SetEnd(u64 value){
+        self->end = value
+    }
+
+    fn GetEnd()->u64{
+        return self->end
+    }
+
+    fn SetStartLine(u64 value){
+        self->startLine = value
+    }
+
+    fn GetStartLine()->u64{
+        return self->startLine
+    }
+
+    fn SetStartColumn(u64 value){
+        self->startColumn = value
+    }
+
+    fn GetStartColumn()->u64{
+        return self->startColumn
+    }
+
+    fn SetEndLine(u64 value){
+        self->endLine = value
+    }
+
+    fn GetEndLine()->u64{
+        return self->endLine
+    }
+
+    fn SetEndColumn(u64 value){
+        self->endColumn = value
+    }
+
+    fn GetEndColumn()->u64{
+        return self->endColumn
+    }
+}
+
+
+struct Token{
+    TokenKind kind
+    string::String value
+    Span span
+}
+
+impl Token{
+    fn Init(TokenKind kind,string::String value,Span span){
+        self->kind  = kind
+        self->value = value
+        self->span  = span
+    }
+
+    fn SetKind(TokenKind value){
+        self->kind = value
+    }
+
+    fn GetKind()->TokenKind{
+        return self->kind
+    }
+
+    fn SetValue(string::String value){
+        self->value = value
+    }
+
+    fn GetValue()->string::String{
+        return self->value
+    }
+
+    fn GetValueCString()->str{
+        return self->value.CString()
+    }
+
+    fn SetSpan(Span value){
+        self->span = value
+    }
+
+    fn GetSpan()->Span{
+        return self->span
+    }
+}
+
+
+
+fn MakeToken(bump::BumpAllocator *bump,TokenKind kind,string::String value,Span span)->Token *{
+    Token *node = bump->AllocType(sizeof(Token),1,alignof(Token))
+
+    node->Init(kind,value,span)
+
+    return node
+}

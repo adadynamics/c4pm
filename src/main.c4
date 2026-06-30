@@ -1,0 +1,209 @@
+use std::fs as fs
+use std::memory::allocators::bump as allocator
+use std::libc::memory as memory
+use std::libc::socket as socket
+use std::string as string
+use std::list   as list
+use cmdline::cmdline as cmdline
+
+use diagnostic::diagnostic as diagnostic
+use lexer::lexer as lexer
+use parser::parser as parser
+
+use argvBuilder::argvBuilder as argvBuilder
+
+
+foreign "C"{
+    fn exit(i32 status)
+    fn printf(str fmt,...)->i32
+    fn puts(str string)->i32
+    fn strchr(const char *string,i32 character)->str
+    fn strrchr(const char *string,i32 character)->str
+    fn strlen(str string)->u64
+    fn strcmp(const char *string1,const char *string2)->i32
+    fn strncmp(const char *string1,const char *string2,u64 count)->i32
+    fn strncpy(char *string1,const char *string2,u64 count)->str
+}
+
+use std::vector as vector
+
+
+const u32 TRUE  = 1
+const u32 FALSE = 0
+
+fn ReadFileToString(str fileName,allocator::BumpAllocator *bump)->str{
+    if (bump == null) or (fileName == null){
+        return null
+    }
+
+    string::String string = fs::Read(fileName)
+    u64 length            = string.length
+    str buffer            = bump->AllocType(sizeof(char),length + 1,alignof(char))
+
+    memory::Memcpy(buffer,string.data,length)
+    buffer[length] = 0
+
+    return buffer
+}
+
+fn Fatal(str string,allocator::BumpAllocator *bump){
+    printf("%s\n compilation terminated\n",string)
+    bump.Destroy()
+    exit(2)
+}
+
+
+fn SetUpCmdLineArguments(i32 argc,str *argv,allocator::BumpAllocator *bump)->cmdline::CmdLineArgumentParser{
+    cmdline::CmdLineArgumentParser parser
+    cmdline::CmdLineArgument *argument
+
+    parser.Init("c4pm","c4 project manager ","0.0.0 [alpha]",bump)
+
+    argument = cmdline::MakeCmdLineArgument(bump,cmdline::CmdLineArgumentKind::String,null,"new","create a new application project")
+    parser.AddArgument(argument)
+
+    argument = cmdline::MakeCmdLineArgument(bump,cmdline::CmdLineArgumentKind::String,null,"lib","create a new library project")
+    parser.AddArgument(argument)
+
+
+    argument = cmdline::MakeCmdLineArgument(bump,cmdline::CmdLineArgumentKind::Flag,null,"build","Build the current project")
+    parser.AddArgument(argument)
+
+    argument = cmdline::MakeCmdLineArgument(bump,cmdline::CmdLineArgumentKind::Flag,null,"run","Build and run the current project")
+    parser.AddArgument(argument)
+
+    argument = cmdline::MakeCmdLineArgument(bump,cmdline::CmdLineArgumentKind::Flag,"h","help","Display this help Message")
+    parser.AddArgument(argument)
+
+    argument = cmdline::MakeCmdLineArgument(bump,cmdline::CmdLineArgumentKind::Flag,"v","version","Show the Compiler version")
+    parser.AddArgument(argument)
+
+    parser.Parse(argc,argv)
+
+    return parser
+}
+
+
+
+fn CreateProject(str projectName,allocator::BumpAllocator *bump){
+    string::String project
+    project.InitBumped(bump)
+    project.PushBack(projectName)
+    project.PushBack("/")
+    project.PushBack("src")
+
+    str name = project.CString()
+
+    socket::Result result
+
+    fs::DirectoryArgument argument
+    argument.Init(511)
+
+    result = fs::CreateDirectoryRecursive(name,argument)
+
+    match result{
+        socket::Result::Ok(ok){
+            
+        }
+        socket::Result::Err(err){
+            Fatal(err,bump)
+        }
+    }
+
+    string::String mainStub
+    mainStub.InitBumped(bump)
+    mainStub.PushBack("\nfn main(i32 argc,str *argv)->i32{\n")
+    mainStub.PushBack("\treturn 0\n")
+    mainStub.PushBack("}\n")
+
+    project.PushBack("/")
+    project.PushBack("main.c4")
+
+    name = project.CString()
+
+    fs::Write(name,mainStub)
+
+
+
+    project.Set(project.length - 11,0)
+    project.length -= 11
+    project.PushBack("c4.c4cfg")
+
+    string::String configStub
+    configStub.InitBumped(bump)
+    configStub.PushBack("[build]\n")
+    configStub.PushBack("compiler = \"c4c\"\n")
+    configStub.PushBack("input    = \"src/main.c4\"\n")
+    configStub.PushBack("output   = \"app\"\n")
+    configStub.PushBack("target   = \"x86_64-linux-gnuC\"\n")
+    configStub.PushBack("emitC    = true\n")
+    configStub.PushBack("#[build]\n")
+
+    name = project.CString()
+
+    fs::Write(name,configStub)
+
+    printf("created application project: %s\n",projectName)
+}
+
+
+fn BuildProject(allocator::BumpAllocator *bump){
+    str fileName     = "c4.c4cfg"
+    str fileContents = ReadFileToString(fileName,bump)
+
+    diagnostic::DiagnosticEngine engine
+    engine.Init(100,bump)
+
+    lexer::Lexer lexer
+    lexer.Init(fileName,fileContents,&engine,bump)
+
+    parser::Parser parser
+    parser.Init(lexer.tokens,bump)
+
+    parser::Configuration configuration
+    configuration.Init(parser.sections)
+
+    argvBuilder::ArgvBuilder argvBuilder
+    argvBuilder.Init(bump,configuration)
+}
+
+fn RunProject(allocator::BumpAllocator *bump){
+    BuildProject(bump)
+}
+
+fn main(i32 argc,char **argv)->i32{
+    vector::Vector<i32> vec
+
+    allocator::BumpAllocator bump
+    bump.Init(1024 * 1024 * 100)
+
+    cmdline::CmdLineArgumentParser parser = SetUpCmdLineArguments(argc,argv,&bump)
+
+    u32 help    = parser.GetValueFlag("help")
+    u32 version = parser.GetValueFlag("version")
+
+    if (help == TRUE) or (argc == 1){
+        parser.PrintHelp()
+    }
+    elif version == TRUE{
+        parser.PrintVersion()
+    }
+    else{
+        if parser.GetValueFlag("build") == TRUE{
+            BuildProject(&bump)
+        }
+        elif parser.GetValueFlag("run") == TRUE{
+            RunProject(&bump)
+        }
+        else{
+            str string = parser.GetValueString("new")
+
+            if string != null{
+                CreateProject(string,&bump)
+            }
+        }
+    }
+
+    bump.Destroy()
+    return 0
+}

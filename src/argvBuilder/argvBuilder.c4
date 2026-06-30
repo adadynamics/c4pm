@@ -1,0 +1,180 @@
+use std::list as list
+use std::memory::allocators::bump as allocator
+use parser::parser as parser
+
+
+use std::process::process as process
+use std::process::processBuilder as processBuilder
+
+foreign "C"{
+    fn execve(char *pathName,str *argv,str *envp)->i32
+    fn printf(str fmt,...)->i32
+    fn perror(const char *string)
+}
+
+const u32 FALSE = 0
+const u32 TRUE  = 1
+
+struct ArgvBuilder{
+    str compilerName
+    list::List arguments
+    processBuilder::ProcessBuilder processBuilder
+    allocator::BumpAllocator *bump
+}
+
+
+
+impl ArgvBuilder{
+    fn Init(allocator::BumpAllocator *bump,parser::Configuration configuration){
+        self->arguments.Init(bump)
+        self->bump         = bump
+        self->compilerName = null
+
+        
+        self->processBuilder.Init(1024 * 10)
+
+        self->BuildFromConfiguration(configuration)
+
+        if self->ExecuteCompiler() == TRUE{
+            self->ExecuteBuildFile()
+        }
+    }
+
+    fn Add(str value){
+        self->processBuilder.AddArgument(value)
+    }
+
+
+    fn BuildFromConfiguration(parser::Configuration configuration){
+        parser::Section *build = configuration.Get("build")
+
+        if build == null{
+            return
+        }
+
+        parser::Entry *entry = null
+
+        self->compilerName = "C4C"
+
+        entry = build->Get("compiler")
+
+        if entry != null{
+            self->compilerName = entry->GetString()
+        }
+
+        self->processBuilder.SetExecutable(self->compilerName)
+
+        entry = build->Get("input")
+
+        if entry != null{
+            self->Add("--input")
+            self->Add(entry->GetString())
+        }
+
+        entry = build->Get("output")
+
+        if entry != null{
+            self->Add("--output")
+            self->Add(entry->GetString())
+        }
+
+        entry = build->Get("target")
+
+        if entry != null{
+            self->Add("--target")
+            self->Add(entry->GetString())
+        }
+
+
+        entry = build->Get("emitC")
+
+        if entry != null and entry->GetBoolean() == TRUE{
+            self->Add("--emit-c")
+        }
+
+        entry = build->Get("asmFiles")
+
+        if entry != null{
+            self->Add("--asmfiles")
+
+            list::List list = entry->GetList()
+
+            str buffer = self->bump.AllocType(sizeof(char),4096,alignof(char))
+
+            u64 offset = 0
+            u64 length = list.Length()
+
+            u64 ii = 0
+            while ii < length{
+                parser::Value *value = list.At(ii)
+
+                str string = value->string
+
+                u64 jj = 0
+                while string[jj] != 0{
+                    buffer[offset] = string[jj]
+                    offset += 1
+                    jj += 1
+                }
+
+                if ii + 1 < length{
+                    buffer[offset] = ','
+                    offset += 1
+                }
+
+                ii += 1
+            }
+
+            buffer[offset] = 0
+
+            self->Add(buffer)
+        }
+    }
+
+    fn ExecuteBuildFile()->u32{
+        self->processBuilder.Reset()
+        self->processBuilder.SetExecutable("/usr/bin/make")
+        self->processBuilder.SetWorkingDirectory(".")
+
+        process::Process process   = self->processBuilder.Spawn()
+        process::ExitStatus status = process.Wait()
+
+        if status.code != 0{
+            printf("build failed: %d\n", status.code)
+            return FALSE
+        }
+        else{
+            printf("build success\n")
+            self->processBuilder.AddArgument("clean")
+
+            process::Process process   = self->processBuilder.Spawn()
+            process::ExitStatus status = process.Wait()
+
+            if status.code != 0{
+                printf("build clean failed: %d\n", status.code)
+                return FALSE
+            }
+            else{
+                printf("build clean success\n")
+                return TRUE
+            }
+        }
+    }
+
+    fn ExecuteCompiler()->u32{
+        process::Process process   = self->processBuilder.Spawn()
+        process::ExitStatus status = process.Wait()
+
+        if status.code != 0{
+            printf("build failed: %d\n", status.code)
+            return FALSE
+        }
+        else{
+            printf("build success\n")
+            return TRUE
+        }
+    }
+}
+
+
+

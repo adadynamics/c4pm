@@ -1,0 +1,410 @@
+use std::list as list
+use std::memory::allocators::bump as allocator
+use lexer::token as token
+
+foreign "C"{
+    fn exit(i32 status)
+    fn printf(str fmt,...)->i32
+    fn puts(str string)->i32
+    fn strchr(const char *string,i32 character)->str
+    fn strrchr(const char *string,i32 character)->str
+    fn strlen(str string)->u64
+    fn strcmp(const char *string1,const char *string2)->i32
+    fn strncmp(const char *string1,const char *string2,u64 count)->i32
+    fn strncpy(char *string1,const char *string2,u64 count)->str
+}
+
+
+const u32 FALSE = 0
+const u32 TRUE  = 1
+
+enum ValueKind{
+    String
+    Int
+    Float
+    Bool
+    List
+}
+
+struct Value{
+    ValueKind kind
+    str string
+    i64 integer
+    i64 floatingPoint   // should be f64
+    u32 boolean
+    list::List list
+}
+
+
+impl Value{
+    fn Init(ValueKind kind){
+        self->kind = kind
+    }
+
+
+    fn GetString()->str{
+        return self->string
+    }
+
+    fn GetInteger()->i64{
+        return self->integer
+    }
+
+    fn GetFloatingPoint()->i64{
+        return self->floatingPoint
+    }
+
+    fn GetBoolean()->u32{
+        return self->boolean
+    }
+
+    fn GetList()->list::List{
+        return self->list
+    }
+
+
+    fn SetString(str string){
+        self->string = string
+    }
+
+    fn SetInteger(i64 integer){
+        self->integer = integer
+    }
+
+    fn SetFloatingPoint(i64 floatingPoint){
+        self->floatingPoint = floatingPoint
+    }
+
+    fn SetBoolean(u32 boolean){
+        self->boolean = boolean
+    }
+
+    fn SetList(list::List list){
+        self->list = list
+    }
+}
+
+fn MakeValue(allocator::BumpAllocator *bump,ValueKind kind)->Value *{
+    Value *node = bump->AllocType(sizeof(Value),1,alignof(Value))
+
+    node->Init(kind)
+
+    return node
+}
+
+
+struct Entry{
+    str key
+    Value *value
+}
+
+
+
+impl Entry{
+    fn Init(str key,Value *value){
+        self->key   = key
+        self->value = value
+    }
+
+    fn GetString()->str{
+        return self->value->GetString()
+    }
+
+    fn GetInteger()->i64{
+        return self->value->GetInteger()
+    }
+
+    fn GetFloatingPoint()->i64{
+        return self->value->GetFloatingPoint()
+    }
+
+
+    fn GetBoolean()->u32{
+        return self->value->GetBoolean()
+    }
+
+    fn GetList()->list::List{
+        return self->value->GetList()
+    }
+}
+
+
+
+
+fn MakeEntry(allocator::BumpAllocator *bump,str key,Value *value)->Entry *{
+    Entry *node = bump->AllocType(sizeof(Entry),1,alignof(Entry))
+
+    node->Init(key,value)
+
+    return node
+}
+
+
+struct Section{
+    str name
+    list::List entries
+}
+
+
+impl Section{
+    fn Init(str name,list::List entries){
+        self->name    = name
+        self->entries = entries
+    }
+
+    fn Get(str key)->Entry *{
+        u64 ii = 0
+
+        while ii < self->entries.Length(){
+            Entry *entry = self->entries.At(ii)
+
+            if strcmp(entry->key,key) == 0{
+                return entry
+            }
+
+            ii += 1
+        }
+
+        return null
+    }
+}
+
+fn MakeSection(allocator::BumpAllocator *bump,str name,list::List entries)->Section *{
+    Section *node = bump->AllocType(sizeof(Section),1,alignof(Section))
+
+    node->Init(name,entries)
+
+    return node
+}
+
+struct Configuration{
+    list::List sections
+}
+
+impl Configuration{
+    fn Init(list::List sections){
+        self->sections = sections
+    }
+
+    fn Get(str name)->Section *{
+        u64 ii = 0
+
+        while ii < self->sections.Length(){
+            Section *section = self->sections.At(ii)
+
+            if strcmp(section->name,name) == 0{
+                return section
+            }
+
+            ii += 1
+        }
+
+        return null
+    }
+}
+
+
+struct Parser{
+    list::List tokens
+    i64 index
+    list::List sections
+    allocator::BumpAllocator *bump
+}
+
+
+
+impl Parser{
+    fn Init(list::List tokens, allocator::BumpAllocator *bump){
+        self->tokens = tokens
+        self->index = 0
+        self->bump = bump
+        self->sections.Init(bump)
+        self->Parse()
+    }
+
+    fn CurrentToken()->token::Token*{
+        if self->index >= self->tokens.Length(){
+            return null
+        }
+
+        return self->tokens.At(self->index)
+    }
+
+    fn Advance(){
+        self->index += 1
+    }
+
+    fn Match(token::TokenKind kind)->u32{
+        token::Token *token = self->CurrentToken()
+        return token != null and token->GetKind() == kind
+    }
+
+    fn Expect(token::TokenKind kind)->token::Token*{
+        token::Token *token = self->CurrentToken()
+        if token == null or token->GetKind() != kind{
+            return null
+        }
+
+        self->Advance()
+        return token
+    }
+
+    fn Parse()->void{
+        while self->index < self->tokens.Length(){
+            if self->Match(token::TokenKind::LBRACKET){
+                Section *section = self->ParseSection()
+                self->sections.PushBack(section)
+            }
+            else{
+                self->Advance()
+            }
+        }
+    }
+
+
+
+    fn ParseSection()->Section *{
+        Section *section
+        list::List entries
+
+        entries.Init(self->bump)
+
+        self->Expect(token::TokenKind::LBRACKET)
+
+        token::Token *token = self->CurrentToken()
+        str name            = token->GetValueCString()
+
+        self->Advance()
+        self->Expect(token::TokenKind::RBRACKET)
+
+        while self->index < self->tokens.Length(){
+            if self->Match(token::TokenKind::HASH){
+                self->Advance() // #
+                self->Expect(token::TokenKind::LBRACKET)
+
+                token::Token *token = self->CurrentToken()
+
+                if token == null {//or strcmp(token->GetValueCString(),name):
+                    return section
+                }
+
+                self->Advance()
+                self->Expect(token::TokenKind::RBRACKET)
+
+                break
+            }
+
+            if self->Match(token::TokenKind::IDENT){
+                token::Token *token = self->CurrentToken()
+                str key             = token->GetValueCString()
+
+                self->Advance()
+                self->Expect(token::TokenKind::ASSIGN)
+
+                Value *value = self->ParseValue()
+                Entry *entry = MakeEntry(self->bump,key,value)
+
+                entries.PushBack(entry)
+            }
+            else{
+                self->Advance()
+            }
+        }
+
+        section = MakeSection(self->bump,name,entries)
+
+        return section
+    }
+
+
+    fn ParseValue()->Value *{
+
+        Value *value        = null
+        token::Token *token = self->CurrentToken()
+
+        if token == null{
+            return value
+        }
+
+        if token->GetKind() == token::TokenKind::LITERAL_STRING{
+            value = MakeValue(self->bump,ValueKind::String)
+
+            value->SetString(token->GetValueCString())
+            self->Advance()
+            return value
+        }
+
+        if token->GetKind() == token::TokenKind::LITERAL_INT{
+            value = MakeValue(self->bump,ValueKind::Int)
+
+            //value->SetInteger(atoi(token->GetValueCString()))
+            self->Advance()
+            return value
+        }
+
+
+
+        if token->GetKind() == token::TokenKind::LITERAL_FLOAT{
+            value = MakeValue(self->bump,ValueKind::Float)
+            //value->SetFloatingPoint(atof(token->GetValueCString()))
+            self->Advance()
+            return value
+        }
+
+        if token->GetKind() == token::TokenKind::KEYWORD_TRUE{
+            value = MakeValue(self->bump,ValueKind::Bool)
+
+            value->SetBoolean(TRUE)
+            self->Advance()
+            return value
+        }
+
+
+
+        if token->GetKind() == token::TokenKind::KEYWORD_FALSE{
+            value = MakeValue(self->bump,ValueKind::Bool)
+
+            value->SetBoolean(FALSE)
+            self->Advance()
+            return value
+        }
+
+        if token->GetKind() == token::TokenKind::LBRACKET{
+            return self->ParseList()
+        }
+
+        return value
+    }
+
+
+    fn ParseList()->Value *{
+
+        Value *value = MakeValue(self->bump,ValueKind::List)
+
+        value->list.Init(self->bump)
+
+        self->Advance() // [
+
+        while self->index < self->tokens.Length(){
+
+            if self->Match(token::TokenKind::RBRACKET){
+                self->Advance()
+                break
+            }
+
+            Value *item = self->ParseValue()
+            value->list.PushBack(item)
+
+            if self->Match(token::TokenKind::COMMA){
+                self->Advance()
+            }
+        }
+
+        return value
+    }
+}
+
+
+
+
+

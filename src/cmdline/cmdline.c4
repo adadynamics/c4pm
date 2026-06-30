@@ -1,0 +1,431 @@
+use std::list as list
+use std::memory::allocators::bump as allocator
+
+foreign "C"{
+    fn exit(i32 status)
+    fn printf(char *fmt,...)->i32
+    fn snprintf(char *string,u64 size,const char *fmt,...)->i32
+    fn strcmp(const char *string1,const char *string2)->i32
+    fn strlen(str string)->u64
+}
+
+const u32 TRUE  = 1
+const u32 FALSE = 0
+
+enum CmdLineArgumentKind{
+    Flag
+    String
+    List
+}
+
+struct CmdLineArgumentValue{
+    u32 flag
+    str string
+    list::List list
+}
+
+struct CmdLineArgument{
+    CmdLineArgumentKind kind
+    str shortName
+    str longName
+    str description
+    u32 isActive
+    CmdLineArgumentValue value
+}
+
+
+impl CmdLineArgument{
+    fn Init(CmdLineArgumentKind kind,str shortName,str longName,str description){
+        self->kind        = kind
+        self->shortName   = shortName
+        self->longName    = longName
+        self->description = description
+        self->isActive    = FALSE
+    }
+
+
+    fn Format(str buffer,u64 size) -> i32{
+        i32 written = 0
+
+        if self->shortName != null{
+            written += snprintf(buffer + written,size - written,"-%s",self->shortName)
+
+            if self->longName != null{
+                written += snprintf(buffer + written,size - written,",")
+            }
+        }
+
+        if self->longName != null{
+            written += snprintf(buffer + written,size - written,"--%s",self->longName)
+        }
+
+        if self->kind == CmdLineArgumentKind::String{
+            if self->longName != null{
+                written += snprintf(buffer + written,size - written," <%s>",self->longName)
+            }
+            else{
+                written += snprintf(buffer + written,size - written," <value>")
+            }
+        }
+
+        return written
+    }
+}
+
+
+
+fn MakeCmdLineArgument(allocator::BumpAllocator *bump,CmdLineArgumentKind kind,str shortName,str longName,str description) -> CmdLineArgument *{
+    if bump == null{
+        return null
+    }
+
+    CmdLineArgument *node = bump.AllocType(sizeof(CmdLineArgument),1,alignof(CmdLineArgument))
+
+    node.Init(kind,shortName,longName,description)
+    node->value.list.Init(bump)
+
+    return node
+}
+
+fn CmdLineSplitComma(list::List *out,str input,allocator::BumpAllocator *bump){
+    str start = input
+
+  
+    str p = input
+    while TRUE{
+        if (p@read() == ',') or (p@read() == 0){
+            u64 len   = p@diff(start)
+            str token = bump.AllocType(sizeof(char),len + 1,alignof(char))
+
+            u64 ii = 0
+            while ii < len{
+                token[ii] = start[ii]
+            }
+
+            token[len] = 0
+            out->PushBack(token)
+
+            if p@read() == 0{
+                break
+            }
+
+            start = p@offset(1)
+        }
+
+        p@advance(1)
+    }
+}
+
+
+
+fn PrintSpaces(u32 count){
+    u32 ii = 0
+    while ii < count{
+        printf(" ")
+        ii += 1
+    }
+}
+
+
+
+struct CmdLineArgumentParser{
+    str name
+    str description
+    str version
+    list::List arguments
+    allocator::BumpAllocator *bump
+}
+
+
+impl CmdLineArgumentParser{
+    fn Init(str name,str description,str version,allocator::BumpAllocator *bump){
+        self->name        = name
+        self->description = description
+        self->version     = version
+        self->bump        = bump
+
+        self->arguments.Init(bump)
+    }
+
+
+    fn AddArgument(CmdLineArgument *argument) -> u32{
+        if self == null || argument == null{
+            return FALSE
+        }
+
+        self->arguments.PushBack(argument)
+
+        return TRUE
+    }
+
+
+    fn Get(str longName) -> CmdLineArgument *{
+        if self == null || longName == null{
+            return null
+        }
+
+        u64 argumentLength = self->arguments.len
+
+        u64 ii = 0
+        while ii < argumentLength{
+            CmdLineArgument *argument = self->arguments.At(ii)
+
+            if strcmp(argument->longName,longName) == 0{
+                return argument
+            }
+
+            ii += 1
+        }
+
+        return null
+    }
+
+
+
+    fn GetDescription(str longName) -> str{
+        CmdLineArgument *argument = self.Get(longName)
+
+        if argument == null || argument->isActive == 0{
+            return null
+        }
+
+        return argument->description
+    }
+
+
+
+    fn GetValueList(str longName) -> list::List{
+        CmdLineArgument *argument = self.Get(longName)
+
+        if argument == null || argument->isActive == 0{
+            list::List empty
+            empty.Init(self->bump)
+            return empty
+        }
+
+        return argument->value.list
+    }
+
+
+
+    fn GetValueString(str longName) -> str{
+        CmdLineArgument *argument = self.Get(longName)
+
+        if argument == null || argument->isActive == 0{
+            return null
+        }
+
+        return argument->value.string
+    }
+
+
+
+    fn GetValueFlag(str longName) -> u32{
+        CmdLineArgument *argument = self.Get(longName)
+
+        if argument == null || argument->isActive == 0{
+            return 0
+        }
+
+        return argument->value.flag
+    }
+
+    fn PrintUsage(){
+        printf("USAGE\n")
+        printf("    %s [OPTIONS] <input>\n\n",self->name)
+    }
+
+    fn PrintDescription(){
+        printf("DESCRIPTION\n")
+        printf("    %s\n\n",self->description)
+    }
+
+
+    fn PrintExamples(){
+        printf("\nEXAMPLES\n\n")
+
+        printf("    Create a new application project:\n")
+        printf("        c4pm --new application\n\n")
+
+        printf("    Create a new library project:\n")
+        printf("        c4pm --lib library\n\n")
+
+        printf("    Build the current project:\n")
+        printf("        c4pm --build\n\n")
+
+        printf("    Build and run the current project:\n")
+        printf("        c4pm --run\n\n")
+    }
+
+    fn PrintOptions(){
+
+        printf("OPTIONS\n")
+
+        u64 maxWidth              = 0
+        u64 argumentLength        = self->arguments.len
+        CmdLineArgument *argument = null
+
+        u64 i = 0
+
+        // Pass 1: compute max width
+        while i < argumentLength{
+            char [256]buffer
+
+            argument = self->arguments.At(i)
+            i32 len = argument.Format(buffer,256)
+
+            if len > maxWidth{
+                maxWidth = len
+            }
+
+            i += 1
+        }
+
+        // Pass 2: print aligned output
+        i = 0
+
+        while i < argumentLength{
+            char [256]buffer
+
+            argument = self->arguments.At(i)
+            i32 len = argument.Format(buffer,256)
+
+            printf("    %s",buffer)
+            PrintSpaces(maxWidth - len + 4)
+            printf("%s\n",argument->description)
+
+            i += 1
+        }
+
+        printf("\n")
+    }
+
+
+    fn PrintHelp(){
+        printf("c4pm version 0.0.0\n")
+        printf("%s\n\n",self->description)
+
+        self.PrintUsage()
+        self.PrintDescription()
+        self.PrintOptions()
+        self.PrintExamples()
+
+        printf("REPORTING BUGS\n")
+        printf("    https://github.com/c4-lang/c4/issues\n")
+    }
+
+        
+    fn PrintVersion(){
+        printf("%s version %s\n",self->name,self->version)
+    }
+
+
+    fn Fatal(str message,str option){
+        printf("%s%s\n",message,option)
+        exit(1)
+    }
+
+
+    fn Parse(i32 argc,str *argv) -> u32{
+        i32 i = 1
+
+        while i < argc{
+            str arg = argv[i]
+
+            if arg[0] == '-'{
+                if strlen(arg) > 1 && arg[1] == '-'{
+                    arg += 2
+
+                    u64 argumentLength = self->arguments.len
+                    u64 j = 0
+
+                    while j < argumentLength{
+                        CmdLineArgument *argument = self->arguments.At(j)
+
+                        if strcmp(argument->longName,arg) == 0{
+                            if argument->kind == CmdLineArgumentKind::Flag{
+                                argument->isActive = TRUE
+                                argument->value.flag = TRUE
+                            }
+                            elif argument->kind == CmdLineArgumentKind::String{
+                                if i + 1 >= argc || argv[i + 1][0] == '-'{
+                                    self.Fatal("expected an argument after a value option --%s",arg)
+                                }
+
+                                argument->isActive = TRUE
+                                argument->value.string = argv[i + 1]
+
+                                i += 1
+                            }
+                            elif argument->kind == CmdLineArgumentKind::List{
+                                argument->isActive = TRUE
+
+                                CmdLineSplitComma(&argument->value.list,argv[i + 1],self->bump)
+
+                                i += 1
+                            }
+                            else{
+                                self.Fatal("unsupported argument kind",null)
+                            }
+                        }
+
+                        j += 1
+                    }
+                }
+                else{
+                    arg += 1
+
+                    u64 argumentLength = self->arguments.len
+                    u64 j = 0
+
+                    while j < argumentLength{
+                        CmdLineArgument *argument = self->arguments.At(j)
+
+                        if argument->shortName != null && strcmp(argument->shortName,arg) == 0{
+                            if argument->kind == CmdLineArgumentKind::Flag{
+                                argument->isActive = TRUE
+                                argument->value.flag = TRUE
+                            }
+                            elif argument->kind == CmdLineArgumentKind::String{
+                                if i + 1 >= argc || argv[i + 1][0] == '-'{
+                                    self.Fatal("expected an argument after a value option -%s",arg)
+                                }
+
+                                argument->isActive = TRUE
+                                argument->value.string = argv[i + 1]
+
+                                i += 1
+                            }
+                            elif argument->kind == CmdLineArgumentKind::List{
+                                if i + 1 >= argc || argv[i][0] == '-'{
+                                    self.Fatal("expected list after -%s",arg)
+                                }
+
+                                argument->isActive = TRUE
+
+                                CmdLineSplitComma(&argument->value.list,argv[i + 1],self->bump)
+
+                                i += 1
+                            }
+                            else{
+                                self.Fatal("unsupported argument kind",null)
+                            }
+                        }
+
+                        j += 1
+                    }
+                }
+            }
+            else{
+                CmdLineArgument *argument = self->arguments.At(0)
+
+                argument->isActive = TRUE
+                argument->value.flag = TRUE
+            }
+
+            i += 1
+        }
+
+        return TRUE
+    }
+}

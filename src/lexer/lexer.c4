@@ -1,0 +1,529 @@
+use std::string as string
+use std::vector as vector
+use std::list   as list
+
+
+use std::memory::allocators::bump as allocator
+
+use diagnostic::diagnostic as diagnostic
+use lexer::token as token
+
+
+const u32 TRUE  = 1
+const u32 FALSE = 0
+
+foreign "C"{
+    fn printf(char *fmt,...)->i32
+    fn strlen(str string)->u64
+}
+
+
+struct Lexer{
+    str fileName
+    str fileSource
+
+    i64 fileLength
+    i64 index
+    i64 current
+
+    u64 start
+    u64 end
+
+    u64 startLine
+    u64 startColumn
+
+    u64 endLine
+    u64 endColumn
+
+    u32 hasErrors
+
+    list::List tokens
+
+    diagnostic::DiagnosticEngine *engine
+    allocator::BumpAllocator *bump
+}
+
+
+impl Lexer{
+    fn Init(str fileName,str fileSource,diagnostic::DiagnosticEngine *engine,allocator::BumpAllocator *bump){
+        self->fileName    = fileName
+        self->fileSource  = fileSource
+        self->fileLength  = strlen(fileSource)
+
+        self->index       = 0
+        self->current     = 0
+
+        self->start       = 0
+        self->end         = 0
+
+        self->startLine   = 1
+        self->startColumn = 0
+
+        self->endLine     = 1
+        self->endColumn   = 0
+
+        self->hasErrors   = FALSE
+
+        self->engine      = engine
+        self->bump        = bump
+
+        self->tokens.Init(bump)
+        self->ScanTokens()
+    }
+
+    fn AtEnd()->u32{
+        return self->index >= self->fileLength
+    }
+
+    fn Peek(i64 lookAhead)->char{
+        if (self->index + lookAhead) >= self->fileLength{
+            return 0
+        }
+        
+        return self->fileSource[self->index + lookAhead]
+    }
+
+
+    fn Consume()->char{
+        if self->AtEnd(){
+            return 0
+        }
+        
+        self->index += 1
+
+        return self->fileSource[self->index - 1]
+    }
+
+
+    fn IsToken(char token,i64 lookAhead)->u32{
+        return self->Peek(lookAhead) == token
+    }
+
+
+    fn MatchToken(char token)->u32{
+        return self->IsToken(token,0)
+    }
+
+
+    fn IsDigit(i64 lookAhead)->u32{
+        char token = self->Peek(lookAhead)
+
+        return (token >= '0') and (token <= '9') 
+    }
+
+
+    fn IsHexDigit(i64 lookAhead)->u32{
+        char token = self->Peek(lookAhead)
+
+        return ( (token >= 0) and (token <= '9') ) or ( (token >= 'a') and (token <= 'f') ) or ( (token >= 'A') and (token <= 'F') )
+    }
+
+
+    fn IsBinaryDigit(i64 lookAhead)->u32{
+        char token = self->Peek(lookAhead)
+
+        return (token == '0') or (token == '1') 
+    }
+
+    fn MakeBinary(){
+        string::String buffer
+        buffer.InitBumped(self->bump)
+
+        // Consume 0b
+        buffer.PushChar(self->Consume())
+        buffer.PushChar(self->Consume())
+
+        while self->IsBinaryDigit(0){
+            buffer.PushChar(self->Consume())
+        }
+
+        self->AddToken(token::TokenKind::LITERAL_INT,buffer)
+    }
+
+
+    fn MakeDecimal(){
+        string::String buffer
+        buffer.InitBumped(self->bump)
+
+        while self->IsDigit(0){
+            buffer.PushChar(self->Consume())
+        }
+
+        self->AddToken(token::TokenKind::LITERAL_INT,buffer)
+    }
+
+
+    fn MakeHex(){
+        string::String buffer
+        buffer.InitBumped(self->bump)
+
+        // Consume 0x
+        buffer.PushChar(self->Consume())
+        buffer.PushChar(self->Consume())
+
+        while self->IsBinaryDigit(0){
+            buffer.PushChar(self->Consume())
+        }
+
+        self->AddToken(token::TokenKind::LITERAL_INT,buffer)
+    }
+
+
+    fn MakeNumber(){
+        if (self->Peek(0) == 0) and ( (self->Peek(1) == 'x') or (self->Peek(1) == 'X')){
+            self->MakeHex()
+        }
+        elif (self->Peek(0) == 0) and ( (self->Peek(1) == 'b') or (self->Peek(1) == 'B')){
+            self->MakeBinary()
+        }
+        else{
+            self->MakeDecimal()
+        }
+    }
+
+
+    fn IsAlpha()->u32{
+        char token = self->Peek(0)
+
+        return ( (token >= 'a') and (token <= 'z') ) or ( (token >= 'A') and (token <= 'Z') ) or (token == '_')
+    }
+
+    fn IsAlphanum()->u32{
+        return self->IsDigit(0) or self->IsAlpha()
+    }
+
+    
+    // ── escape sequence decoding ─────────────────────────────────────────
+    //
+    // Shared by MakeString and MakeCharacter. Called immediately AFTER the
+    // backslash itself has already been consumed by the caller — i.e.
+    // self->Peek(0) is the character that follows '\'. Consumes the rest of
+    // the escape sequence (1 char for simple escapes like \n, 2 more for
+    // \xHH) and returns the decoded byte value. On an unrecognized escape,
+    // reports a diagnostic and returns the offending character unchanged so
+    // the lexer can keep going instead of aborting the whole file over one
+    // bad literal.
+    fn DecodeEscape()->char{
+        char esc = self->Consume()
+
+        if esc == 'n'{
+            return 10  // '\n' line feed
+        }
+        elif esc == 't'{
+            return 9   // '\t' tab
+        }
+        elif esc == 'r'{
+            return 13  // '\r' carriage return
+        }
+        elif esc == '0'{
+            return 0   // '\0' nul
+        }
+        elif esc == 92{ // '\\'
+            return 92
+        }
+        elif esc == 39{ // '\''
+            return 39
+        }
+        elif esc == '"'{
+            return 34  // '\"'
+        }
+        elif esc == 'a'{
+            return 7   // '\a' bell
+        }
+        elif esc == 'b'{
+            return 8   // '\b' backspace
+        }
+        elif esc == 'f'{
+            return 12  // '\f' form feed
+        }
+        elif esc == 'v'{
+            return 11  // '\v' vertical tab
+        }
+        elif esc == 'x'{
+            // \xHH — exactly two hex digits, ASCII-range only (0x00-0xFF).
+            if (not self->IsHexDigit(0)) or (not self->IsHexDigit(1)){
+                self->ErrorHere("invalid hex escape sequence","expected exactly two hex digits after \\x")
+                return 'x'
+            }
+
+            char hi = self->Consume()
+            char lo = self->Consume()
+
+            return self->HexDigitValue(hi) * 16 + self->HexDigitValue(lo)
+        }
+        else{
+            self->ErrorHere("unknown escape sequence","unrecognized character after backslash")
+            return esc
+        }
+    }
+
+
+    // Converts a single verified hex digit character into its 0-15 value.
+    // Caller must already have checked the character is a valid hex digit
+    // (e.g. via IsHexDigit) — this does not itself validate.
+    fn HexDigitValue(char c)->char{
+        if (c >= '0') and (c <= '9'){
+            return c - '0'
+        }
+        elif (c >= 'a') and (c <= 'f'){
+            return (c - 'a') + 10
+        }
+        elif (c >= 'A') and (c <= 'F'){
+            return (c - 'A') + 10
+        }
+
+        return 0
+    }
+
+    
+    // Emits a diagnostic anchored to the lexer's current start/end span.
+    // Shared error-reporting helper for MakeString/MakeCharacter/
+    // DecodeEscape, following the same Report -> AddLabel/AddHelp shape
+    // used (commented-out) in ScanToken's invalid-character branch.
+    fn ErrorHere(str message,str help){
+        self->hasErrors = TRUE
+
+        token::Span span
+        span.Init(self->start,self->index,self->startLine,self->startColumn,self->endLine,self->endColumn)
+
+        diagnostic::Diagnostic *diagnostic = self->engine->Report(diagnostic::DiagnosticSeverity::Error,message,self->fileName,self->fileSource,self->fileLength,1)
+
+        if diagnostic != null{
+            diagnostic->AddLabel(span,"here",TRUE,self->bump)
+            diagnostic->AddHelp(help,self->bump)
+        }
+    }
+
+    // ── string literals ──────────────────────────────────────────────────
+    //
+    // Scans a double-quoted string literal: "...". Called with the opening
+    // quote still unconsumed, matching the convention every other Make*
+    // function uses (start from self->Peek(0)). Decodes every standard
+    // ASCII escape sequence via DecodeEscape, including \xHH byte escapes.
+    // An unterminated string — running off the end of the file, or hitting
+    // a bare newline before the closing quote — is reported as an error,
+    // but whatever was scanned up to that point is still emitted as a
+    // token so the parser has something to recover on rather than losing
+    // sync with the rest of the file.
+    fn MakeString(){
+        string::String buffer
+        buffer.InitBumped(self->bump)
+
+        // consume opening "
+        self->Consume()
+        self->AdvanceColumn(1)
+
+        while TRUE{
+            if self->AtEnd(){
+                self->ErrorHere("unterminated string literal","add a closing \" before end of file")
+                break
+            }
+
+            char c = self->Peek(0)
+
+            if c == '"'{
+                self->Consume()
+                self->AdvanceColumn(1)
+                break
+            }
+            elif c == 10{ // '\n' — bare newlines are not allowed inside a string
+                self->ErrorHere("unterminated string literal","strings cannot span multiple lines; close the string with \" or use \\n instead")
+                break
+            }
+            elif c == 92{ // '\\'
+                self->Consume()
+                self->AdvanceColumn(1)
+
+                char decoded = self->DecodeEscape()
+                buffer.PushChar(decoded)
+
+                // DecodeEscape consumes 1 char for simple escapes or 3 for
+                // \xHH (the 'x' plus two hex digits); the column for the
+                // escape's own backslash was already advanced above, so
+                // account for the remainder of the sequence here.
+                self->AdvanceColumn(1)
+            }
+            else{
+                buffer.PushChar(self->Consume())
+                self->AdvanceColumn(1)
+            }
+        }
+
+        self->AddToken(token::TokenKind::LITERAL_STRING,buffer)
+    }
+
+
+    fn MatchKeyword(string::String string1,char *string2)->u32{
+        return string1.Equals(string2)
+    }
+
+
+    fn AddKeywords(string::String string){
+        if self->MatchKeyword(string,"false"){
+            self->AddToken(token::TokenKind::KEYWORD_FALSE,string)
+        }
+        elif self->MatchKeyword(string,"true"){
+            self->AddToken(token::TokenKind::KEYWORD_TRUE,string)
+        }
+        else{
+            self->AddToken(token::TokenKind::IDENT,string)
+        }
+    }
+
+
+    fn MakeIdentifier(){
+        string::String buffer
+        buffer.InitBumped(self->bump)
+
+        while self->IsAlphanum(){
+            buffer.PushChar(self->Consume())
+        }
+
+        self->AdvanceColumn(buffer.length)
+        self->AddKeywords(buffer)
+    }
+
+
+
+    fn AdvanceColumn(u64 amount){
+        self->endColumn += amount
+    }
+
+
+
+    fn AdvanceLine(u64 amount){
+        self->endLine   += amount
+        self->endColumn = 0
+    }
+
+
+    fn AddToken(token::TokenKind kind,string::String string){
+        token::Token *token = null
+        token::Span span
+        span.Init(self->start,self->index,self->startLine,self->startColumn,self->endLine,self->endColumn)
+
+        token = token::MakeToken(self->bump,kind,string,span)
+
+        self->tokens.PushBack(token)
+    }
+
+
+
+    fn AddTokenSingle(token::TokenKind kind,string::String string){
+        self->Consume()
+        self->AddToken(kind,string)
+        self->AdvanceColumn(1)
+    }
+
+
+    fn AddTokenDouble(token::TokenKind kind,string::String string){
+        self->Consume()
+        self->Consume()
+        self->AddToken(kind,string)
+        self->AdvanceColumn(2)
+    }
+
+
+
+    fn AddTokenTriple(token::TokenKind kind,string::String string){
+        self->Consume()
+        self->Consume()
+        self->Consume()
+        self->AddToken(kind,string)
+        self->AdvanceColumn(3)
+    }
+
+
+    fn ScanToken(){
+        string::String buffer
+        buffer.InitBumped(self->bump)
+
+        char token = self->Peek(0)
+
+        if self->IsAlpha(){
+            self->MakeIdentifier()
+        }
+        elif self->IsDigit(0){
+            self->MakeNumber()
+        }
+        elif self->MatchToken('"'){
+            self->MakeString()
+        }
+        elif self->MatchToken('['){
+            buffer.PushBack("[")
+            self->AddTokenSingle(token::TokenKind::LBRACKET,buffer)
+        }
+        elif self->MatchToken(']'){
+            buffer.PushBack("]")
+            self->AddTokenSingle(token::TokenKind::RBRACKET,buffer)
+        }
+        elif self->MatchToken(','){
+            buffer.PushBack(",")
+            self->AddTokenSingle(token::TokenKind::COMMA,buffer)
+        }
+        elif self->MatchToken(9){ // '\t'
+            self->AdvanceColumn(4)
+            self->Consume()
+        }
+        elif self->MatchToken(32){ // ' '
+            self->AdvanceColumn(1)
+            self->Consume()
+        }
+        elif self->MatchToken(13){ // '\r'
+            self->AdvanceColumn(1)
+            self->Consume()
+        }
+        elif self->MatchToken(10){ // '\n'
+            self->Consume()
+            self->AdvanceLine(1)
+        }
+        elif self->MatchToken('.'){
+            buffer.PushBack(".")
+            self->AddTokenSingle(token::TokenKind::DOT,buffer)
+        }
+        elif self->MatchToken('.'){
+            buffer.PushBack("#")
+            self->AddTokenSingle(token::TokenKind::HASH,buffer)
+        }
+        elif self->MatchToken('/'){
+            while not self->MatchToken(10){ // while not new line
+                self->Consume()
+            }
+        }
+        elif self->MatchToken('='){
+            buffer.PushBack("=")
+            self->AddTokenSingle(token::TokenKind::ASSIGN,buffer)
+        }
+        else{
+            self->Consume()
+
+            self->hasErrors = TRUE
+            self->index     = self->index
+
+            token::Span span
+            span.Init(self->start,self->index,self->startLine,self->startColumn,self->endLine,self->endColumn)
+
+            diagnostic::Diagnostic *diagnostic = null
+            
+            //diagnostic = self->engine.Report(diagnostic::DiagnosticKind::Error,"invalid character",self->fileName,self->fileSource,self->fileLength,1)
+
+            //diagnostic->AddLabel(span,"unexpected character",TRUE,self->bump)
+            //diagnostic->AddHelp("remove this character",self->bump)
+        }
+    }
+
+    fn ScanTokens(){
+        while not self->AtEnd(){
+            self->start       = self->index
+            self->startLine   = self->endLine
+            self->startColumn = self->endColumn
+
+            self->ScanToken()
+        }
+
+    }
+
+    fn PrintTokens(str outputFileName){
+
+    }
+}
